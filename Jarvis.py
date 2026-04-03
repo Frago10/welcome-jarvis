@@ -12,7 +12,7 @@ import pyttsx3
 import speech_recognition as sr
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Configuración/Configuration
+#  Configuración/Configuration 
 # ──────────────────────────────────────────────────────────────────────────────
 SAMPLE_RATE    = 44100
 BLOCK_SIZE     = int(SAMPLE_RATE * 0.05)   # 50 ms por bloque
