@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 import time
 import threading
@@ -19,6 +20,7 @@ BLOCK_SIZE     = int(SAMPLE_RATE * 0.05)   # 50 ms por bloque
 THRESHOLD      = 0.07     # RMS mínimo para contar como aplauso  ← ajusta si falla
 COOLDOWN       = 0.1    # segundos de pausa mínima entre aplausos
 DOUBLE_WINDOW  = 2.0     # ventana de tiempo para el segundo aplauso
+WAIT_AFTER_SEQUENCE = 30.0  # segundos para volver a escuchar después de ejecutar la secuencia
 
 # Configuración de audio
 INPUT_DEVICE   = None    # None = dispositivo por defecto, o especifica índice
@@ -41,6 +43,10 @@ SISTEMA        = platform.system()  # "Darwin" (macOS), "Windows", "Linux"
 clap_times: list[float] = []
 triggered = False
 voice_triggered = False
+sequence_running = False
+clap_in_progress = False
+last_clap_time = 0.0
+stop_event = threading.Event()
 lock = threading.Lock()
 
 
@@ -48,16 +54,24 @@ lock = threading.Lock()
 #  Detección de aplausos/Clap detection
 # ──────────────────────────────────────────────────────────────────────────────
 def audio_callback(indata, frames, time_info, status):
-    global triggered, clap_times
-
-    if triggered:
-        return
+    global triggered, clap_times, sequence_running, clap_in_progress, last_clap_time
 
     rms = float(np.sqrt(np.mean(indata ** 2)))
     now = time.time()
 
     if rms > THRESHOLD:
         with lock:
+            if triggered or sequence_running:
+                return
+
+            # Si ya estamos en un aplauso, ignora los bloques siguientes de la misma señal
+            if clap_in_progress:
+                last_clap_time = now
+                return
+
+            clap_in_progress = True
+            last_clap_time = now
+
             # Ignora si estamos en el cooldown del aplauso anterior
             if clap_times and (now - clap_times[-1]) < COOLDOWN:
                 return
@@ -71,8 +85,13 @@ def audio_callback(indata, frames, time_info, status):
 
             if count >= 2:
                 triggered = True
+                sequence_running = True
                 clap_times = []
                 threading.Thread(target=secuencia_bienvenida, daemon=True).start()
+    else:
+        with lock:
+            if clap_in_progress and (now - last_clap_time) > 0.15:
+                clap_in_progress = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -95,13 +114,18 @@ def escuchar_comandos_voz():
 #  Secuencia de bienvenida/Welcome sequence
 # ──────────────────────────────────────────────────────────────────────────────
 def secuencia_bienvenida():
-    print("\n🚀  Iniciando secuencia de bienvenida…\n")
+    global sequence_running
+    try:
+        print("\n🚀  Iniciando secuencia de bienvenida…\n")
 
-    hablar(MENSAJE)
-    abrir_youtube()
-    abrir_apps_lado_a_lado()
+        hablar(MENSAJE)
+        abrir_youtube()
+        abrir_apps_lado_a_lado()
 
-    print("\n✅  Secuencia completada.\n")
+        print("\n✅  Secuencia completada.\n")
+    finally:
+        with lock:
+            sequence_running = False
 
 
 def hablar(texto: str):
@@ -261,6 +285,8 @@ def listar_dispositivos_audio():
 
 def probar_microfono():
     """Prueba rápida del micrófono para verificar niveles de ruido."""
+    global THRESHOLD
+
     print("\n🎤  Probando micrófono por 3 segundos...")
     
     rms_values = []
@@ -283,9 +309,15 @@ def probar_microfono():
         if rms_values:
             avg_rms = np.mean(rms_values)
             max_rms = np.max(rms_values)
+            suggested = max(max_rms * 5, 0.005)
+            if suggested < THRESHOLD:
+                THRESHOLD = suggested
+                print(f"  🔧  Umbral ajustado a {THRESHOLD:.4f} basado en el ruido ambiente")
+            else:
+                print(f"  🔧  Umbral recomendado: {suggested:.4f} (mantiene {THRESHOLD:.4f})")
             print(f"  📊  RMS promedio: {avg_rms:.3f}")
             print(f"  📊  RMS máximo: {max_rms:.3f}")
-            print("  💡 Si el ruido ambiente es alto, aumenta el THRESHOLD")
+            print("  💡 Si el ruido ambiente es alto, puede que necesites subir THRESHOLD")
         else:
             print("  ⚠️  No se pudieron capturar datos del micrófono")
             
@@ -371,6 +403,16 @@ def encontrar_cursor():
 def main():
     global triggered, voice_triggered
 
+    def handle_exit(signum, frame):
+        print("\n\nDeteniendo Jarvis...")
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, handle_exit)
+    try:
+        signal.signal(signal.SIGTERM, handle_exit)
+    except AttributeError:
+        pass
+
     print("=" * 55)
     print("  🎤  Jarvis - Detector Inteligente")
     print("=" * 55)
@@ -399,15 +441,17 @@ def main():
             dtype="float32",
             callback=audio_callback,
         ):
-            while True:
+            while not stop_event.is_set():
                 time.sleep(0.1)
                 if triggered or voice_triggered:
                     # Espera a que la secuencia acabe y vuelve a escuchar
-                    time.sleep(8)
-                    triggered = False
-                    voice_triggered = False
+                    stop_event.wait(WAIT_AFTER_SEQUENCE)
+                    with lock:
+                        triggered = False
+                        voice_triggered = False
                     print("\n👂  Escuchando de nuevo…\n")
     except KeyboardInterrupt:
+        stop_event.set()
         print("\n\nHasta luego! 👋")
         sys.exit(0)
     except Exception as e:
